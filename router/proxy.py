@@ -2,7 +2,8 @@ import os
 import json
 import time
 import httpx
-from typing import Dict, Any, List, Tuple, AsyncGenerator
+import re
+from typing import Dict, Any, List, Tuple, AsyncGenerator, Optional
 from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -30,6 +31,7 @@ class ProxyHandler:
         self.classifier = classifier
         self.config = config
         self.tiers = config.get("tiers", {})
+        self.cascade_enabled = config.get("routing", {}).get("cascade_enabled", True)
 
     def get_tier_settings(self, tier: int) -> Tuple[str, str, str]:
         """Returns provider, model, and api_key env variable for a given tier."""
@@ -38,7 +40,6 @@ class ProxyHandler:
         provider = settings.get("provider", "openai")
         model = settings.get("model", "")
         
-        # Fallback to defaults if model is empty
         if not model:
             if tier == 1:
                 model = "gpt-4o-mini"
@@ -50,8 +51,7 @@ class ProxyHandler:
 
     def calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> Tuple[float, float]:
         """Calculates input and output costs based on model pricing."""
-        # Find match in pricing dictionary (handling prefixes)
-        match_model = "gpt-4o-mini" # default fallback
+        match_model = "gpt-4o-mini"
         for key in PRICING:
             if key in model.lower():
                 match_model = key
@@ -67,11 +67,31 @@ class ProxyHandler:
         usage = data.get("usage", {})
         return usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
 
+    def validate_output(self, text: str) -> Tuple[bool, str]:
+        """Validates LLM output for common syntax errors and code failures."""
+        if not text or len(text.strip()) < 10:
+            return False, "Response is too short or empty"
+            
+        blocks = re.findall(r'```[a-zA-Z0-9#\+\-]*\n(.*?)\n```', text, re.DOTALL)
+        for block in blocks:
+            # Check Python syntax errors
+            if "IndentationError:" in block or "TabError:" in block or "SyntaxError:" in block:
+                return False, f"Contains code compilation error indicators"
+            
+            # Check curly brackets match
+            if block.count('{') != block.count('}'):
+                return False, "Mismatched curly braces in code block"
+                
+        # Check truncation
+        last_char = text.strip()[-1]
+        if last_char not in ['.', '!', '?', '"', "'", '}', ']', ')', '`', ';', '>']:
+            return False, "Response appears truncated (ends abruptly)"
+            
+        return True, "Validation passed"
+
     def openai_to_anthropic_req(self, openai_req: Dict[str, Any], target_model: str) -> Dict[str, Any]:
         """Converts OpenAI request payload to Anthropic structure."""
         messages = openai_req.get("messages", [])
-        
-        # Extract system messages
         system_parts = []
         filtered_messages = []
         
@@ -88,7 +108,6 @@ class ProxyHandler:
             else:
                 filtered_messages.append(msg)
 
-        # Normalize messages for Anthropic (must alternate user/assistant, must start with user)
         normalized_messages = []
         for msg in filtered_messages:
             role = msg.get("role")
@@ -141,19 +160,21 @@ class ProxyHandler:
         requested_model = body.get("model", "default")
         stream = body.get("stream", False)
 
-        # 1. Lookup in Cache
-        cached_resp, cache_hit_type = await self.cache.lookup(messages)
+        # Optimization 2: Canonicalize system and user messages to stabilize prompt caching
+        canonical_messages = self.classifier.canonicalize_messages(messages)
+        body["messages"] = canonical_messages
+
+        # 1. Lookup in Cache (using local TF-IDF if configured)
+        cached_resp, cache_hit_type = await self.cache.lookup(canonical_messages)
         if cached_resp:
             duration_ms = int((time.time() - start_time) * 1000)
             print(f"Cache Hit ({cache_hit_type})! Serving immediately.")
 
-            # Record metrics for cache hit
-            input_tokens = self.classifier.estimate_tokens(str(messages))
+            input_tokens = self.classifier.estimate_tokens(str(canonical_messages))
             output_tokens = self.classifier.estimate_tokens(str(cached_resp))
             
-            # Cached response is free
             self.db.log_request(
-                prompt=self.cache.get_query_text(messages),
+                prompt=self.cache.get_query_text(canonical_messages),
                 complexity_score=0.0,
                 routed_model="CACHED",
                 requested_model=requested_model,
@@ -165,10 +186,10 @@ class ProxyHandler:
                 tier_selected=0,
                 routing_reason=f"Served from {cache_hit_type} cache",
                 duration_ms=duration_ms,
-                cache_hit=cache_hit_type
+                cache_hit=cache_hit_type,
+                success=1
             )
 
-            # Return cached response (supporting streaming replay if client requested stream)
             if stream:
                 async def stream_cache_replay() -> AsyncGenerator[bytes, None]:
                     chunk = {
@@ -189,19 +210,28 @@ class ProxyHandler:
             return cached_resp
 
         # 2. Analyze complexity
-        tier, complexity_score, reason = self.classifier.analyze_request(messages)
-        provider, routed_model, api_key_env = self.get_tier_settings(tier)
+        tier, complexity_score, reason = self.classifier.analyze_request(canonical_messages)
+        
+        # Optimization 1: Cascade cheap-first routing
+        is_cascade = self.cascade_enabled and tier == 2
+        
+        if is_cascade:
+            print(f"Cascade Active: Attempting cheap Tier 1 model first for complexity {complexity_score:.2f}.")
+            run_tier = 1
+            routing_reason = f"Cascade (Tier 1 Attempt); {reason}"
+        else:
+            run_tier = tier
+            routing_reason = reason
+
+        provider, routed_model, api_key_env = self.get_tier_settings(run_tier)
         api_key = os.getenv(api_key_env)
 
         if not api_key:
-            # Fallback to other tiers or default keys
-            print(f"Warning: API Key {api_key_env} not found in environment. Trying fallbacks.")
-            # Search alternative key
-            for key_env in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"]:
+            # Check backup env variables
+            for key_env in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"]:
                 fallback_key = os.getenv(key_env)
                 if fallback_key:
                     api_key = fallback_key
-                    # Update provider & model based on what key we found
                     if "GEMINI" in key_env:
                         provider, routed_model = "gemini", "gemini-1.5-flash"
                     elif "ANTHROPIC" in key_env:
@@ -216,35 +246,17 @@ class ProxyHandler:
                     detail="No API Keys found. Please set OPENAI_API_KEY, GEMINI_API_KEY, or ANTHROPIC_API_KEY."
                 )
 
-        print(f"Routing logic: Routed to Tier {tier} ({provider}/{routed_model}). Reason: {reason}")
-
-        # Override request body model
         body["model"] = routed_model
 
         if provider == "openai":
             url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            return await self._dispatch_request("openai", url, headers, body, canonical_messages, complexity_score, routed_model, requested_model, run_tier, routing_reason, start_time, is_cascade)
 
         elif provider == "gemini":
-            # Use Gemini's OpenAI-compatible endpoint
             url = "https://generativelanguage.googleapis.com/v1beta/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
-
-        elif provider == "deepseek":
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            return await self._dispatch_request("gemini", url, headers, body, canonical_messages, complexity_score, routed_model, requested_model, run_tier, routing_reason, start_time, is_cascade)
 
         elif provider == "anthropic":
             url = "https://api.anthropic.com/v1/messages"
@@ -254,16 +266,345 @@ class ProxyHandler:
                 "content-type": "application/json"
             }
             anthropic_body = self.openai_to_anthropic_req(body, routed_model)
-            return await self._proxy_anthropic(url, headers, anthropic_body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
+            return await self._dispatch_request("anthropic", url, headers, anthropic_body, canonical_messages, complexity_score, routed_model, requested_model, run_tier, routing_reason, start_time, is_cascade)
 
         else:
             raise HTTPException(status_code=500, detail=f"Unsupported provider: {provider}")
+
+    async def _dispatch_request(self, provider: str, url: str, headers: Dict[str, str], body: Dict[str, Any], 
+                                  messages: List[Dict[str, Any]], complexity_score: float, 
+                                  routed_model: str, requested_model: str, tier: int, 
+                                  reason: str, start_time: float, is_cascade: bool) -> Any:
+        """Dispatches the API request, and executes cascade fallback logic if enabled and validation fails."""
+        stream = body.get("stream", False)
+
+        if not stream:
+            # Non-streaming cascade
+            res_data, err_msg = await self._execute_call(provider, url, headers, body, routed_model)
+            
+            if err_msg:
+                if is_cascade:
+                    print(f"Tier 1 call failed ({err_msg}). Escalating to Tier 2 immediately.")
+                    return await self._escalate_to_tier2(body, messages, complexity_score, requested_model, reason, start_time)
+                else:
+                    raise HTTPException(status_code=500, detail=f"Upstream API error: {err_msg}")
+
+            # Parse content text
+            content_text = ""
+            if provider in ["openai", "gemini"]:
+                content_text = res_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            elif provider == "anthropic":
+                content_text = ""
+                for block in res_data.get("content", []):
+                    if block.get("type") == "text":
+                        content_text += block.get("text", "")
+
+            # Run Cascade Validation Check
+            if is_cascade:
+                valid, val_msg = self.validate_output(content_text)
+                if not valid:
+                    print(f"Tier 1 validation failed: {val_msg}. Escalating to Tier 2.")
+                    # Log failure in database for tracking
+                    in_tokens = self.classifier.estimate_tokens(str(messages))
+                    out_tokens = self.classifier.estimate_tokens(content_text)
+                    in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
+                    self.db.log_request(
+                        prompt=self.cache.get_query_text(messages),
+                        complexity_score=complexity_score,
+                        routed_model=routed_model,
+                        requested_model=requested_model,
+                        provider=provider,
+                        input_tokens=in_tokens,
+                        output_tokens=out_tokens,
+                        input_cost=in_cost,
+                        output_cost=out_cost,
+                        tier_selected=1,
+                        routing_reason=f"Cascade Try (Failed validation: {val_msg})",
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        cache_hit="none",
+                        success=0 # failed
+                    )
+                    # Escalate
+                    return await self._escalate_to_tier2(body, messages, complexity_score, requested_model, f"Escalated (Tier 1 failed: {val_msg})", start_time)
+                else:
+                    print("Tier 1 validation passed. Returning Cascade response.")
+                    # Succeeded! Let's return and log success
+                    in_tokens = self.classifier.estimate_tokens(str(messages))
+                    out_tokens = self.classifier.estimate_tokens(content_text)
+                    in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
+                    duration_ms = int((time.time() - start_time) * 1000)
+
+                    # Wrap Anthropic to OpenAI format if needed
+                    if provider == "anthropic":
+                        res_data = self._translate_anthropic_to_openai_res(res_data, routed_model)
+
+                    self.db.log_request(
+                        prompt=self.cache.get_query_text(messages),
+                        complexity_score=complexity_score,
+                        routed_model=routed_model,
+                        requested_model=requested_model,
+                        provider=provider,
+                        input_tokens=in_tokens,
+                        output_tokens=out_tokens,
+                        input_cost=in_cost,
+                        output_cost=out_cost,
+                        tier_selected=1,
+                        routing_reason=f"Cascade Success; {reason}",
+                        duration_ms=duration_ms,
+                        cache_hit="none",
+                        success=1 # success
+                    )
+                    await self.cache.save(messages, res_data, provider, routed_model)
+                    return res_data
+
+            # Normal Non-Streaming
+            else:
+                duration_ms = int((time.time() - start_time) * 1000)
+                if provider == "anthropic":
+                    res_data = self._translate_anthropic_to_openai_res(res_data, routed_model)
+                
+                in_tokens, out_tokens = self.parse_openai_usage(res_data)
+                in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
+
+                self.db.log_request(
+                    prompt=self.cache.get_query_text(messages),
+                    complexity_score=complexity_score,
+                    routed_model=routed_model,
+                    requested_model=requested_model,
+                    provider=provider,
+                    input_tokens=in_tokens,
+                    output_tokens=out_tokens,
+                    input_cost=in_cost,
+                    output_cost=out_cost,
+                    tier_selected=tier,
+                    routing_reason=reason,
+                    duration_ms=duration_ms,
+                    cache_hit="none",
+                    success=None # pending agent feedback
+                )
+                await self.cache.save(messages, res_data, provider, routed_model)
+                return res_data
+
+        # Streaming Request logic
+        else:
+            if is_cascade:
+                # For streaming cascade: we must buffer chunks internally to check validation.
+                # If valid -> yield buffered chunks. If invalid -> discard and stream Tier 2.
+                print("Cascade Streaming: buffering Tier 1 stream for validation...")
+                buffered_chunks = []
+                accumulated_text = ""
+                
+                client = httpx.AsyncClient(timeout=60.0)
+                if provider == "anthropic":
+                    # For Anthropic streaming, we must yield OpenAI format chunks, let's parse them
+                    req = client.build_request("POST", url, headers=headers, json=body)
+                    try:
+                        response = await client.send(req, stream=True)
+                        response.raise_for_status()
+                    except Exception as e:
+                        await client.aclose()
+                        return await self._escalate_to_tier2(body, messages, complexity_score, requested_model, f"Tier 1 stream error: {str(e)}", start_time)
+                    
+                    in_tokens = self.classifier.estimate_tokens(str(messages))
+                    buffer = ""
+                    async for chunk in response.aiter_text():
+                        buffer += chunk
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            if line.strip().startswith("data:"):
+                                data_str = line.replace("data:", "").strip()
+                                try:
+                                    data_json = json.loads(data_str)
+                                    if data_json.get("type") == "content_block_delta":
+                                        txt = data_json.get("delta", {}).get("text", "")
+                                        accumulated_text += txt
+                                        
+                                        openai_chunk = {
+                                            "id": "chatcmpl-cascade",
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": routed_model,
+                                            "choices": [{"index": 0, "delta": {"content": txt}, "finish_reason": None}]
+                                        }
+                                        buffered_chunks.append(f"data: {json.dumps(openai_chunk)}\n\n".encode("utf-8"))
+                                except Exception:
+                                    pass
+                    await response.aclose()
+                    await client.aclose()
+
+                else: # OpenAI / Gemini streaming
+                    req = client.build_request("POST", url, headers=headers, json=body)
+                    try:
+                        response = await client.send(req, stream=True)
+                        response.raise_for_status()
+                    except Exception as e:
+                        await client.aclose()
+                        return await self._escalate_to_tier2(body, messages, complexity_score, requested_model, f"Tier 1 stream error: {str(e)}", start_time)
+
+                    async for chunk in response.aiter_bytes():
+                        buffered_chunks.append(chunk)
+                        lines = chunk.decode("utf-8", errors="ignore").split("\n")
+                        for line in lines:
+                            if line.strip().startswith("data:"):
+                                data_str = line.replace("data:", "").strip()
+                                if data_str != "[DONE]":
+                                    try:
+                                        data_json = json.loads(data_str)
+                                        txt = data_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                        if txt:
+                                            accumulated_text += txt
+                                    except Exception:
+                                        pass
+                    await response.aclose()
+                    await client.aclose()
+
+                # Validate buffered output
+                valid, val_msg = self.validate_output(accumulated_text)
+                if not valid:
+                    print(f"Tier 1 stream validation failed: {val_msg}. Discarding and escalating to Tier 2.")
+                    # Log failure in DB
+                    in_tokens = self.classifier.estimate_tokens(str(messages))
+                    out_tokens = self.classifier.estimate_tokens(accumulated_text)
+                    in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
+                    self.db.log_request(
+                        prompt=self.cache.get_query_text(messages),
+                        complexity_score=complexity_score,
+                        routed_model=routed_model,
+                        requested_model=requested_model,
+                        provider=provider,
+                        input_tokens=in_tokens,
+                        output_tokens=out_tokens,
+                        input_cost=in_cost,
+                        output_cost=out_cost,
+                        tier_selected=1,
+                        routing_reason=f"Cascade Stream Try (Failed: {val_msg})",
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        cache_hit="none",
+                        success=0
+                    )
+                    # Escalate to Tier 2 stream
+                    return await self._escalate_to_tier2(body, messages, complexity_score, requested_model, f"Escalated (Tier 1 failed: {val_msg})", start_time)
+                else:
+                    print("Tier 1 stream validation passed. Streaming buffered chunks to client.")
+                    # Stream the buffered chunks
+                    async def replay_buffered() -> AsyncGenerator[bytes, None]:
+                        for chunk in buffered_chunks:
+                            yield chunk
+                        yield b"data: [DONE]\n\n"
+                        
+                        # Log success in DB
+                        in_tokens = self.classifier.estimate_tokens(str(messages))
+                        out_tokens = self.classifier.estimate_tokens(accumulated_text)
+                        in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
+                        self.db.log_request(
+                            prompt=self.cache.get_query_text(messages),
+                            complexity_score=complexity_score,
+                            routed_model=routed_model,
+                            requested_model=requested_model,
+                            provider=provider,
+                            input_tokens=in_tokens,
+                            output_tokens=out_tokens,
+                            input_cost=in_cost,
+                            output_cost=out_cost,
+                            tier_selected=1,
+                            routing_reason=f"Cascade Stream Success; {reason}",
+                            duration_ms=int((time.time() - start_time) * 1000),
+                            cache_hit="none",
+                            success=1
+                        )
+                        # Save in cache
+                        mock_res = {
+                            "id": "chatcmpl-completed",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": routed_model,
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": accumulated_text}, "finish_reason": "stop"}]
+                        }
+                        await self.cache.save(messages, mock_res, provider, routed_model)
+
+                    return StreamingResponse(replay_buffered(), media_type="text/event-stream")
+
+            # Normal streaming routing
+            else:
+                if provider in ["openai", "gemini"]:
+                    return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
+                else:
+                    return await self._proxy_anthropic(url, headers, body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
+
+    async def _execute_call(self, provider: str, url: str, headers: Dict[str, str], body: Dict[str, Any], routed_model: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Executes a synchronous POST API call returning json data or error string."""
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                response = await client.post(url, headers=headers, json=body)
+                if response.status_code != 200:
+                    return None, f"Status code {response.status_code}: {response.text}"
+                return response.json(), None
+            except Exception as e:
+                return None, str(e)
+
+    async def _escalate_to_tier2(self, body: Dict[str, Any], messages: List[Dict[str, Any]], 
+                                  complexity_score: float, requested_model: str, 
+                                  reason: str, start_time: float) -> Any:
+        """Escalates request execution to Tier 2 model."""
+        provider2, routed_model2, api_key_env2 = self.get_tier_settings(2)
+        api_key2 = os.getenv(api_key_env2)
+        
+        if not api_key2:
+            raise HTTPException(status_code=500, detail=f"No API Key found for Tier 2: {api_key_env2}")
+
+        body["model"] = routed_model2
+        print(f"Escalation executing Tier 2 model: {provider2}/{routed_model2}")
+
+        if provider2 == "openai":
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key2}", "Content-Type": "application/json"}
+            return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+
+        elif provider2 == "gemini":
+            url = "https://generativelanguage.googleapis.com/v1beta/openai/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key2}", "Content-Type": "application/json"}
+            return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+
+        elif provider2 == "anthropic":
+            url = "https://api.anthropic.com/v1/messages"
+            headers = {
+                "x-api-key": api_key2,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+            anthropic_body = self.openai_to_anthropic_req(body, routed_model2)
+            return await self._proxy_anthropic(url, headers, anthropic_body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+
+    def _translate_anthropic_to_openai_res(self, res_data: Dict[str, Any], model: str) -> Dict[str, Any]:
+        """Translates Anthropic JSON response to OpenAI JSON format."""
+        content_blocks = res_data.get("content", [])
+        text_content = ""
+        for block in content_blocks:
+            if block.get("type") == "text":
+                text_content += block.get("text", "")
+
+        usage = res_data.get("usage", {})
+        return {
+            "id": f"chatcmpl-{res_data.get('id', 'msg')}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text_content},
+                "finish_reason": "stop" if res_data.get("stop_reason") == "end_turn" else res_data.get("stop_reason")
+            }],
+            "usage": {
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            }
+        }
 
     async def _proxy_openai(self, url: str, headers: Dict[str, str], body: Dict[str, Any], 
                             messages: List[Dict[str, Any]], complexity_score: float, 
                             routed_model: str, requested_model: str, provider: str, 
                             tier: int, reason: str, start_time: float) -> Any:
-        """Proxies requests to OpenAI-compatible endpoints."""
         client = httpx.AsyncClient(timeout=60.0)
         stream = body.get("stream", False)
 
@@ -282,7 +623,6 @@ class ProxyHandler:
             in_tokens, out_tokens = self.parse_openai_usage(res_data)
             in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
 
-            # Log request
             self.db.log_request(
                 prompt=self.cache.get_query_text(messages),
                 complexity_score=complexity_score,
@@ -296,14 +636,12 @@ class ProxyHandler:
                 tier_selected=tier,
                 routing_reason=reason,
                 duration_ms=duration_ms,
-                cache_hit="none"
+                cache_hit="none",
+                success=None
             )
 
-            # Cache response
             await self.cache.save(messages, res_data, provider, routed_model)
             return res_data
-
-        # Streaming Response
         else:
             req = client.build_request("POST", url, headers=headers, json=body)
             try:
@@ -319,10 +657,8 @@ class ProxyHandler:
                 
                 try:
                     async for chunk in response.aiter_bytes():
-                        # Yield the raw chunk to client
                         yield chunk
                         
-                        # Process chunk for logging & caching
                         lines = chunk.decode("utf-8", errors="ignore").split("\n")
                         for line in lines:
                             if line.strip().startswith("data:"):
@@ -343,30 +679,17 @@ class ProxyHandler:
                     await response.aclose()
                     await client.aclose()
 
-                    # Save complete response to DB log and cache
                     duration_ms = int((time.time() - start_time) * 1000)
                     output_tokens = self.classifier.estimate_tokens(accumulated_text)
                     in_cost, out_cost = self.calculate_cost(routed_model, input_tokens, output_tokens)
 
-                    # Create a mock completion response to save in cache
                     mock_res = {
                         "id": "chatcmpl-completed",
                         "object": "chat.completion",
                         "created": int(time.time()),
                         "model": routed_model,
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": accumulated_text
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": input_tokens,
-                            "completion_tokens": output_tokens,
-                            "total_tokens": input_tokens + output_tokens
-                        }
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": accumulated_text}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens, "total_tokens": input_tokens + output_tokens}
                     }
 
                     self.db.log_request(
@@ -382,9 +705,9 @@ class ProxyHandler:
                         tier_selected=tier,
                         routing_reason=reason,
                         duration_ms=duration_ms,
-                        cache_hit="none"
+                        cache_hit="none",
+                        success=None
                     )
-
                     await self.cache.save(messages, mock_res, provider, routed_model)
 
             return StreamingResponse(openai_stream_generator(), media_type="text/event-stream")
@@ -393,7 +716,6 @@ class ProxyHandler:
                                messages: List[Dict[str, Any]], complexity_score: float, 
                                routed_model: str, requested_model: str, provider: str, 
                                tier: int, reason: str, start_time: float) -> Any:
-        """Proxies requests to Anthropic and translates to OpenAI response structure."""
         client = httpx.AsyncClient(timeout=60.0)
         stream = body.get("stream", False)
 
@@ -410,42 +732,13 @@ class ProxyHandler:
 
             duration_ms = int((time.time() - start_time) * 1000)
             
-            # Extract usage
             usage = res_data.get("usage", {})
             in_tokens = usage.get("input_tokens", 0)
             out_tokens = usage.get("output_tokens", 0)
             
-            # Extract content text
-            content_blocks = res_data.get("content", [])
-            text_content = ""
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    text_content += block.get("text", "")
-
-            # Translate to OpenAI structure
-            openai_res = {
-                "id": f"chatcmpl-{res_data.get('id', 'msg')}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": routed_model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": text_content
-                    },
-                    "finish_reason": "stop" if res_data.get("stop_reason") == "end_turn" else res_data.get("stop_reason")
-                }],
-                "usage": {
-                    "prompt_tokens": in_tokens,
-                    "completion_tokens": out_tokens,
-                    "total_tokens": in_tokens + out_tokens
-                }
-            }
-
+            openai_res = self._translate_anthropic_to_openai_res(res_data, routed_model)
             in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
 
-            # Log request
             self.db.log_request(
                 prompt=self.cache.get_query_text(messages),
                 complexity_score=complexity_score,
@@ -459,14 +752,12 @@ class ProxyHandler:
                 tier_selected=tier,
                 routing_reason=reason,
                 duration_ms=duration_ms,
-                cache_hit="none"
+                cache_hit="none",
+                success=None
             )
 
-            # Cache response
             await self.cache.save(messages, openai_res, provider, routed_model)
             return openai_res
-
-        # Streaming Response
         else:
             req = client.build_request("POST", url, headers=headers, json=body)
             try:
@@ -489,13 +780,7 @@ class ProxyHandler:
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
                             line = line.strip()
-                            if not line:
-                                continue
-                            
-                            # Anthropic streaming events format:
-                            # event: <event_name>
-                            # data: <json>
-                            if line.startswith("event:"):
+                            if not line or line.startswith("event:"):
                                 continue
                             
                             if line.startswith("data:"):
@@ -504,7 +789,6 @@ class ProxyHandler:
                                     data_json = json.loads(data_str)
                                     event_type = data_json.get("type")
                                     
-                                    # Extract metadata or content delta
                                     text_delta = ""
                                     if event_type == "message_start":
                                         msg_id = data_json.get("message", {}).get("id", msg_id)
@@ -520,17 +804,12 @@ class ProxyHandler:
                                         out_tokens = usage.get("output_tokens", out_tokens)
 
                                     if text_delta:
-                                        # Yield converted OpenAI-style SSE chunk
                                         openai_chunk = {
                                             "id": f"chatcmpl-{msg_id}",
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": routed_model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {"content": text_delta},
-                                                "finish_reason": None
-                                            }]
+                                            "choices": [{"index": 0, "delta": {"content": text_delta}, "finish_reason": None}]
                                         }
                                         yield f"data: {json.dumps(openai_chunk)}\n\n".encode("utf-8")
                                 except Exception:
@@ -538,36 +817,20 @@ class ProxyHandler:
                 finally:
                     await response.aclose()
                     await client.aclose()
-
-                    # Yield the standard [DONE] chunk
                     yield b"data: [DONE]\n\n"
 
-                    # Complete metrics and caching
                     duration_ms = int((time.time() - start_time) * 1000)
                     if out_tokens == 0:
                         out_tokens = self.classifier.estimate_tokens(accumulated_text)
                     
                     in_cost, out_cost = self.calculate_cost(routed_model, in_tokens, out_tokens)
-
-                    # Mock complete response
                     mock_res = {
                         "id": f"chatcmpl-{msg_id}",
                         "object": "chat.completion",
                         "created": int(time.time()),
                         "model": routed_model,
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": accumulated_text
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": in_tokens,
-                            "completion_tokens": out_tokens,
-                            "total_tokens": in_tokens + out_tokens
-                        }
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": accumulated_text}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": in_tokens, "completion_tokens": out_tokens, "total_tokens": in_tokens + out_tokens}
                     }
 
                     self.db.log_request(
@@ -583,9 +846,9 @@ class ProxyHandler:
                         tier_selected=tier,
                         routing_reason=reason,
                         duration_ms=duration_ms,
-                        cache_hit="none"
+                        cache_hit="none",
+                        success=None
                     )
-
                     await self.cache.save(messages, mock_res, provider, routed_model)
 
             return StreamingResponse(anthropic_stream_generator(), media_type="text/event-stream")

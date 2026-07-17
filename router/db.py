@@ -51,6 +51,13 @@ class RouterDB:
             )
         """)
 
+        # Alter table to add success column if it doesn't exist (schema migration)
+        try:
+            cursor.execute("ALTER TABLE request_logs ADD COLUMN success INTEGER DEFAULT NULL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
         conn.commit()
         conn.close()
 
@@ -87,7 +94,6 @@ class RouterDB:
         results = []
         for row in rows:
             try:
-                # Convert blob back to float list
                 embedding_bytes = row["embedding"]
                 embedding = list(float(v) for v in json.loads(embedding_bytes.decode('utf-8')))
                 results.append({
@@ -97,10 +103,24 @@ class RouterDB:
                     "provider": row["provider"],
                     "model": row["model"]
                 })
-            except Exception as e:
-                # Log error or pass if corrupt
+            except Exception:
                 pass
         return results
+
+    def get_all_cache_entries(self) -> List[Dict[str, Any]]:
+        """Retrieves all cache entries for local semantic TF-IDF caching."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT prompt, response, provider, model FROM cache")
+        rows = cursor.fetchall()
+        conn.close()
+        return [{
+            "prompt": row["prompt"],
+            "response": json.loads(row["response"]),
+            "provider": row["provider"],
+            "model": row["model"]
+        } for row in rows]
 
     def add_cache(self, prompt_hash: str, prompt: str, response: Dict[str, Any], 
                   embedding: Optional[List[float]] = None, provider: str = "", model: str = ""):
@@ -122,7 +142,6 @@ class RouterDB:
             )
             conn.commit()
         except sqlite3.Error as e:
-            # Let it fail gracefully
             print(f"Database error writing to cache: {e}")
         finally:
             conn.close()
@@ -131,28 +150,56 @@ class RouterDB:
                     requested_model: str, provider: str, input_tokens: int, 
                     output_tokens: int, input_cost: float, output_cost: float, 
                     tier_selected: int, routing_reason: str, duration_ms: int, 
-                    cache_hit: str):
-        """Logs request analytics into the SQLite database."""
+                    cache_hit: str, success: Optional[int] = None) -> int:
+        """Logs request analytics into the SQLite database and returns the row ID."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        row_id = -1
         try:
             cursor.execute(
                 """
                 INSERT INTO request_logs (
                     prompt, complexity_score, routed_model, requested_model, provider,
                     input_tokens, output_tokens, input_cost, output_cost, 
-                    tier_selected, routing_reason, duration_ms, cache_hit
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tier_selected, routing_reason, duration_ms, cache_hit, success
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (prompt, complexity_score, routed_model, requested_model, provider,
                  input_tokens, output_tokens, input_cost, output_cost,
-                 tier_selected, routing_reason, duration_ms, cache_hit)
+                 tier_selected, routing_reason, duration_ms, cache_hit, success)
             )
             conn.commit()
+            row_id = cursor.lastrowid
         except sqlite3.Error as e:
             print(f"Database error writing to log: {e}")
         finally:
             conn.close()
+        return row_id
+
+    def update_feedback(self, prompt: str, success: int) -> bool:
+        """Updates the success status of the most recent log matching the prompt query."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        updated = False
+        try:
+            cursor.execute(
+                "SELECT id FROM request_logs WHERE prompt = ? ORDER BY timestamp DESC LIMIT 1",
+                (prompt,)
+            )
+            row = cursor.fetchone()
+            if row:
+                log_id = row[0]
+                cursor.execute(
+                    "UPDATE request_logs SET success = ? WHERE id = ?",
+                    (success, log_id)
+                )
+                conn.commit()
+                updated = True
+        except sqlite3.Error as e:
+            print(f"Database error updating feedback: {e}")
+        finally:
+            conn.close()
+        return updated
 
     def get_metrics(self) -> Dict[str, Any]:
         """Calculates aggregate metrics for the dashboard."""
@@ -171,6 +218,13 @@ class RouterDB:
         cursor.execute("SELECT COUNT(*) as semantic_hits FROM request_logs WHERE cache_hit = 'semantic'")
         semantic_hits = cursor.fetchone()["semantic_hits"] or 0
 
+        # Success metrics
+        cursor.execute("SELECT COUNT(*) as feedback_total FROM request_logs WHERE success IS NOT NULL")
+        feedback_total = cursor.fetchone()["feedback_total"] or 0
+
+        cursor.execute("SELECT COUNT(*) as success_count FROM request_logs WHERE success = 1")
+        success_count = cursor.fetchone()["success_count"] or 0
+
         # Token usage & Cost
         cursor.execute("""
             SELECT 
@@ -184,13 +238,9 @@ class RouterDB:
         total_out_tokens = row["total_out_tokens"] or 0
         total_actual_cost = row["total_actual_cost"] or 0.0
 
-        # Calculate "Hypothetical cost" if all requests had gone to the high-quality model directly
-        # Let's say high-quality is Claude 3.5 Sonnet ($3.00/$15.00 per M tokens).
-        # We will assume a baseline of $3.00/1M input and $15.00/1M output for estimating savings.
-        # Plus, for cached hits, the savings is 100%.
+        # Calculate "Hypothetical cost"
         cursor.execute("""
             SELECT 
-                SUM(input_tokens + output_tokens) as total_saved_tokens,
                 SUM(CASE 
                     WHEN cache_hit IN ('exact', 'semantic') THEN (input_tokens * 3.0 / 1000000.0) + (output_tokens * 15.0 / 1000000.0)
                     WHEN tier_selected = 1 THEN ((input_tokens * 3.0 / 1000000.0) + (output_tokens * 15.0 / 1000000.0)) - (input_cost + output_cost)
@@ -198,8 +248,7 @@ class RouterDB:
                 END) as cost_savings
             FROM request_logs
         """)
-        savings_row = cursor.fetchone()
-        cost_savings = savings_row["cost_savings"] or 0.0
+        cost_savings = cursor.fetchone()["cost_savings"] or 0.0
 
         # Get average latency
         cursor.execute("SELECT AVG(duration_ms) as avg_latency FROM request_logs")
@@ -216,7 +265,7 @@ class RouterDB:
         cursor.execute("""
             SELECT timestamp, requested_model, routed_model, provider, 
                    (input_tokens + output_tokens) as tokens, (input_cost + output_cost) as cost, 
-                   duration_ms, cache_hit, tier_selected, routing_reason 
+                   duration_ms, cache_hit, tier_selected, routing_reason, success
             FROM request_logs 
             ORDER BY timestamp DESC 
             LIMIT 50
@@ -226,6 +275,7 @@ class RouterDB:
         conn.close()
 
         cache_hit_rate = ((exact_hits + semantic_hits) / total_reqs * 100) if total_reqs > 0 else 0.0
+        success_rate = (success_count / feedback_total * 100) if feedback_total > 0 else 100.0
 
         return {
             "total_requests": total_reqs,
@@ -238,5 +288,7 @@ class RouterDB:
             "average_latency_ms": round(avg_latency, 2),
             "tier1_count": t1_count,
             "tier2_count": t2_count,
+            "success_rate": round(success_rate, 1),
+            "feedback_total": feedback_total,
             "history": history
         }

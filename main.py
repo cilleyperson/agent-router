@@ -72,6 +72,28 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=500, detail="Proxy Handler not initialized")
     return await proxy_handler.handle_request(request)
 
+# Agent feedback loops endpoint
+@app.post("/v1/feedback")
+async def receive_feedback(request: Request):
+    if not router_db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        
+    prompt = body.get("prompt")
+    success = body.get("success")
+    
+    if prompt is None or success is None:
+        raise HTTPException(status_code=400, detail="Missing required parameters: 'prompt' and 'success'")
+        
+    val = 1 if success else 0
+    updated = router_db.update_feedback(prompt, val)
+    if updated:
+        return {"status": "success", "message": "Agent feedback recorded successfully."}
+    return {"status": "not_found", "message": "No matching request prompt found in logs."}
+
 # OpenAI models list endpoint (for tool compatibility)
 @app.get("/v1/models")
 async def list_models():
@@ -179,6 +201,7 @@ def main():
         print(f"Cache Hit Rate:          {metrics['cache_hit_rate']}%")
         print(f"  Exact Hits:            {metrics['exact_hits']}")
         print(f"  Semantic Hits:         {metrics['semantic_hits']}")
+        print(f"Compiler Success Rate:   {metrics['success_rate']}% ({metrics['feedback_total']} runs)")
         print(f"Total Tokens Saved:      {metrics['total_tokens']}")
         print(f"Total Model Cost:        ${metrics['total_cost']:.4f}")
         print(f"Accumulated Cost Saved:  ${metrics['cost_savings']:.4f}")

@@ -81,6 +81,10 @@ function updateStats(data) {
     // 4. Average Latency
     document.getElementById("avgLatency").textContent = `${data.average_latency_ms.toFixed(0)}ms`;
 
+    // 5. Success rate
+    document.getElementById("successRate").textContent = `${data.success_rate.toFixed(1)}%`;
+    document.getElementById("feedbackCount").textContent = `Feedback: ${data.feedback_total} runs`;
+
     // History count badge
     document.getElementById("historyCount").textContent = `Last ${data.history ? data.history.length : 0} requests`;
 }
@@ -204,6 +208,16 @@ function updateTable(logs) {
         const totalCost = log.cost;
         const costStr = totalCost === 0 ? "$0.0000" : `$${totalCost.toFixed(5)}`;
 
+        // Success / Failure Icon
+        let successIcon = "";
+        if (log.success === 1) {
+            successIcon = `<span style="color: var(--emerald-light); margin-right: 8px;" title="Run succeeded"><i class="fa-solid fa-circle-check"></i></span>`;
+        } else if (log.success === 0) {
+            successIcon = `<span style="color: var(--rose-light); margin-right: 8px;" title="Run failed or escalated"><i class="fa-solid fa-circle-xmark"></i></span>`;
+        } else {
+            successIcon = `<span style="color: var(--text-muted); margin-right: 8px;" title="No feedback"><i class="fa-solid fa-circle-minus"></i></span>`;
+        }
+
         row.innerHTML = `
             <td>${timeStr}</td>
             <td><code>${log.requested_model}</code></td>
@@ -214,7 +228,9 @@ function updateTable(logs) {
             <td>${log.tokens}</td>
             <td style="color: var(--emerald-light); font-weight: 500;">${costStr}</td>
             <td>${log.duration_ms} ms</td>
-            <td style="max-width: 240px; overflow: hidden; text-overflow: ellipsis;" title="${log.routing_reason}">${log.routing_reason || '-'}</td>
+            <td style="max-width: 240px; overflow: hidden; text-overflow: ellipsis;" title="${log.routing_reason}">
+                ${successIcon} ${log.routing_reason || '-'}
+            </td>
         `;
 
         tbody.appendChild(row);

@@ -269,6 +269,12 @@ body {
     border-color: rgba(168, 85, 247, 0.15);
 }
 
+.success-card .stat-icon {
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.08);
+    border-color: rgba(56, 189, 248, 0.15);
+}
+
 .stat-content {
     display: flex;
     flex-direction: column;
@@ -297,6 +303,12 @@ body {
 
 .cache-card .stat-value {
     background: var(--gradient-cache-text);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.success-card .stat-value {
+    background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
 }

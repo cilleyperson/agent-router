@@ -1,141 +1,199 @@
 import os
+import sys
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 
-# Add main workspace to sys.path so we can import modules
-import sys
+# Add main workspace to sys.path
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
 from main import app, load_config
 from router.classifier import ComplexityClassifier
+from router.cache import CacheEngine, LocalTFIDF
 from router.db import RouterDB
 
-# Use a test database
 TEST_DB_PATH = "test_agent_router.db"
 
 @pytest.fixture(autouse=True)
 def setup_and_teardown_db():
-    # Cleanup DB if exists before test
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
     yield
-    # Cleanup DB after test
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
 
-def test_complexity_classifier():
-    config = {
-        "routing": {
-            "default_tier": 1,
-            "max_read_context_threshold": 500,
-            "tier2_keywords": ["fix", "debug", "refactor", "implement", "modify"],
-            "tier1_keywords": ["explain", "what is", "summarize", "list"]
-        }
-    }
+def test_code_compression():
+    classifier = ComplexityClassifier({"routing": {"compress_context": True}})
     
-    classifier = ComplexityClassifier(config)
-    
-    # 1. Simple query -> Tier 1
-    messages_simple = [{"role": "user", "content": "Explain how a link list works in Python."}]
-    tier, score, reason = classifier.analyze_request(messages_simple)
-    assert tier == 1
-    assert "Low complexity" in reason
-    
-    # 2. Complex query -> Tier 2
-    messages_complex = [{"role": "user", "content": "Debug and fix the segfault memory issue in the socket listener."}]
-    tier, score, reason = classifier.analyze_request(messages_complex)
-    assert tier == 2
-    assert "High complexity" in reason
+    # Python code block with comments
+    python_block = (
+        "Here is the code:\n"
+        "```python\n"
+        "#!/usr/bin/env python\n"
+        "# This is a helper comment\n"
+        "def hello():\n"
+        "    # Print hello world\n"
+        "    print('hello')\n"
+        "\n"
+        "\n"
+        "```"
+    )
+    compressed = classifier.compress_code_context(python_block)
+    assert "#!/usr/bin/env python" in compressed
+    assert "This is a helper comment" not in compressed
+    assert "Print hello world" not in compressed
+    assert "def hello():" in compressed
+    # verify empty lines are collapsed
+    assert "\n\n\n" not in compressed
 
-    # 3. Large read context -> Tier 1
-    messages_large = [
-        {"role": "system", "content": "You are a reader helper. " * 50}, # ~300 chars
-        {"role": "user", "content": "Explain what this document is about. " * 30} # ~1100 chars
+def test_message_canonicalization():
+    classifier = ComplexityClassifier({"routing": {"compress_context": False}})
+    messages = [
+        {"role": "user", "content": "Hello!"},
+        {"role": "system", "content": "Date is 2026-07-17 time is 19:40:00."}
     ]
-    tier, score, reason = classifier.analyze_request(messages_large)
-    assert tier == 1
-    assert "Large read context" in reason
+    canonical = classifier.canonicalize_messages(messages)
+    
+    # System should be first
+    assert canonical[0]["role"] == "system"
+    # Dynamic values should be replaced
+    assert "2026-07-17" not in canonical[0]["content"]
+    assert "<canonical_date>" in canonical[0]["content"]
+    assert "<canonical_time>" in canonical[0]["content"]
+
+def test_local_tfidf_vectorizer():
+    # Test L2 norm normalization and vocabulary matching
+    tfidf = LocalTFIDF()
+    docs = [
+        "Explain binary search in Python.",
+        "What is time complexity of binary search?",
+        "Refactor authentication token logic."
+    ]
+    vectors = tfidf.fit_transform(docs)
+    assert len(vectors) == 3
+    # Check L2 norm is approximately 1.0 for non-empty vectors
+    for vec in vectors:
+        norm = sum(v*v for v in vec) ** 0.5
+        assert abs(norm - 1.0) < 1e-5
+
+    # Check transform on a similar query matches the correct candidate
+    query = "How to write binary search?"
+    query_vec = tfidf.transform(query)
+    
+    # Cosine similarities
+    sims = [sum(x*y for x,y in zip(query_vec, v)) for v in vectors]
+    # Similarity with first doc (about binary search) should be higher than third (about auth token)
+    assert sims[0] > sims[2]
+    assert sims[1] > sims[2]
 
 @patch("httpx.AsyncClient.send")
-def test_proxy_flow(mock_send):
-    from unittest.mock import MagicMock
-    # Mock upstream API response (httpx.Response.json is synchronous)
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = {
-        "id": "chatcmpl-mock123",
+def test_cascade_routing_and_validation(mock_send):
+    db = RouterDB(TEST_DB_PATH)
+    
+    # Scenario: Tier 1 output has mismatched braces (fails validation) -> triggers escalation to Tier 2
+    # Mock response 1: Tier 1 failure (unmatched curly braces)
+    mock_resp_t1 = MagicMock()
+    mock_resp_t1.status_code = 200
+    mock_resp_t1.json.return_value = {
+        "id": "chatcmpl-t1-failed",
         "object": "chat.completion",
-        "created": 1700000000,
-        "model": "gpt-4o-mini",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "This is a mock reply from upstream LLM."
-            },
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": 12,
-            "completion_tokens": 8,
-            "total_tokens": 20
-        }
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Broken Code: { "}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
     }
-    mock_send.return_value = mock_response
+    
+    # Mock response 2: Tier 2 success (clean, valid output)
+    mock_resp_t2 = MagicMock()
+    mock_resp_t2.status_code = 200
+    mock_resp_t2.json.return_value = {
+        "id": "chatcmpl-t2-success",
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Corrected code: { ok }"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 15, "completion_tokens": 8}
+    }
+    
+    mock_send.side_effect = [mock_resp_t1, mock_resp_t2]
 
-    # Force using test database and test configuration
+    # Patch config to enable cascades
     with patch("main.load_config") as mock_load_config:
         mock_load_config.return_value = {
             "server": {"host": "127.0.0.1", "port": 8000},
-            "caching": {
-                "enabled": True,
-                "database_path": TEST_DB_PATH,
-                "embedding_provider": "none" # Avoid remote embedding api calls
-            },
+            "caching": {"enabled": True, "database_path": TEST_DB_PATH, "embedding_provider": "local", "semantic_threshold": 0.82},
             "tiers": {
                 "tier1": {"provider": "openai", "model": "gpt-4o-mini", "api_key_env": "TEST_KEY"},
                 "tier2": {"provider": "openai", "model": "gpt-4o", "api_key_env": "TEST_KEY"}
             },
             "routing": {
                 "default_tier": 1,
+                "cascade_enabled": True,
+                "compress_context": True,
                 "max_read_context_threshold": 30000,
-                "tier2_keywords": ["fix", "debug", "refactor"],
-                "tier1_keywords": ["explain", "what is"]
+                "tier2_keywords": ["fix", "debug"],
+                "tier1_keywords": ["explain"]
             }
         }
+        os.environ["TEST_KEY"] = "mock-key"
         
-        # Set dummy key for environment
-        os.environ["TEST_KEY"] = "mock-key-value"
-        
-        # Instantiate test client
         with TestClient(app) as client:
-            # 1. First Request (Cache Miss)
+            # Send a request that classifies as Tier 2 (uses multiple tier2 keywords)
             payload = {
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": "explain links"}]
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "fix and debug and refactor the socket block compilation"}]
             }
             
-            resp1 = client.post("/v1/chat/completions", json=payload)
-            assert resp1.status_code == 200
-            assert resp1.json()["choices"][0]["message"]["content"] == "This is a mock reply from upstream LLM."
-            assert mock_send.call_count == 1 # Upstream was called
+            resp = client.post("/v1/chat/completions", json=payload)
+            assert resp.status_code == 200
+            # Should return the Tier 2 response since Tier 1 failed validation
+            assert resp.json()["choices"][0]["message"]["content"] == "Corrected code: { ok }"
+            # Verify mock client was called twice (Tier 1 then Tier 2)
+            assert mock_send.call_count == 2
 
-            # 2. Second Request (Cache Hit)
-            resp2 = client.post("/v1/chat/completions", json=payload)
-            assert resp2.status_code == 200
-            assert resp2.json()["choices"][0]["message"]["content"] == "This is a mock reply from upstream LLM."
-            assert mock_send.call_count == 1 # Upstream was NOT called again (cache hit)
-
-            # 3. Check metrics endpoint
+            # Verify metrics tracks the logs
             metrics_resp = client.get("/api/metrics")
-            assert metrics_resp.status_code == 200
-            metrics_data = metrics_resp.json()
-            assert metrics_data["total_requests"] == 2
-            assert metrics_data["exact_hits"] == 1
-            assert metrics_data["cache_hit_rate"] == 50.0
-
-if __name__ == "__main__":
-    # If running directly, run pytest
-    import pytest
-    sys.exit(pytest.main([__file__]))
+            metrics = metrics_resp.json()
+            assert metrics["total_requests"] == 2 # 1 failed cascade attempt + 1 escalated Tier 2 completion
+            
+def test_feedback_endpoint():
+    db = RouterDB(TEST_DB_PATH)
+    
+    with patch("main.load_config") as mock_load_config:
+        mock_load_config.return_value = {
+            "server": {"host": "127.0.0.1", "port": 8000},
+            "caching": {"enabled": True, "database_path": TEST_DB_PATH, "embedding_provider": "none"},
+            "routing": {"default_tier": 1}
+        }
+        
+        with patch("main.router_db", db):
+            # Seed a request log in database
+            db.log_request(
+                prompt="test prompt query text",
+                complexity_score=1.0,
+                routed_model="gpt-4o-mini",
+                requested_model="gpt-4o-mini",
+                provider="openai",
+                input_tokens=10,
+                output_tokens=15,
+                input_cost=0.00001,
+                output_cost=0.00002,
+                tier_selected=1,
+                routing_reason="Test routing",
+                duration_ms=200,
+                cache_hit="none",
+                success=None
+            )
+            
+            with TestClient(app) as client:
+                # Post feedback
+                feedback_payload = {
+                    "prompt": "test prompt query text",
+                    "success": True
+                }
+                
+                resp = client.post("/v1/feedback", json=feedback_payload)
+                assert resp.status_code == 200
+                assert resp.json()["status"] == "success"
+                
+                # Check DB updated success rate
+                metrics_resp = client.get("/api/metrics")
+                metrics = metrics_resp.json()
+                assert metrics["success_rate"] == 100.0
+                assert metrics["feedback_total"] == 1

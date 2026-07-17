@@ -38,14 +38,19 @@ caching:
   enabled: true
   database_path: "agent_router.db"
   # Threshold for semantic cache match (0.0 to 1.0)
-  semantic_threshold: 0.88
+  semantic_threshold: 0.82
   # Provider and model to generate embeddings for semantic caching
-  embedding_provider: "openai" # openai, gemini, or none (falls back to exact cache only)
-  embedding_model: "text-embedding-3-small"
+  # Set to "local" to use the fast, offline TF-IDF semantic router
+  embedding_provider: "local" 
+  embedding_model: "none"
 
 # Routing rules
 routing:
   default_tier: 1
+  # Cheap-first validation cascade: run Tier 1 first and validate before Tier 2
+  cascade_enabled: true
+  # Code context compaction: strip whitespace and comments before forwarding prompts
+  compress_context: true
   # Max character length of prompt before bypassing complex checks and using Tier 1 for reads
   max_read_context_threshold: 30000
   # Keywords indicating a Tier 2 task
