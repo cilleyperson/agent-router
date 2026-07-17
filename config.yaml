@@ -1,0 +1,81 @@
+# Agent Router Configuration
+
+server:
+  host: "127.0.0.1"
+  port: 8000
+  log_level: "info"
+
+# Model Tier definitions
+# Tier 1 (Low-Cost, High-Efficiency) -> used for simple tasks, reads, code explanations
+# Tier 2 (High-Quality, Advanced Reasoning) -> used for code changes, debugging, complex logic
+tiers:
+  tier1:
+    provider: "openai"       # can be openai, anthropic, gemini, deepseek
+    model: "gpt-4o-mini"
+    api_key_env: "OPENAI_API_KEY"
+  tier2:
+    provider: "anthropic"
+    model: "claude-3-5-sonnet-20241022"
+    api_key_env: "ANTHROPIC_API_KEY"
+
+# Fallback models in case of rate limits or service down
+fallbacks:
+  openai:
+    tier1: "gpt-4o-mini"
+    tier2: "gpt-4o"
+  anthropic:
+    tier1: "claude-3-5-haiku-20241022"
+    tier2: "claude-3-5-sonnet-20241022"
+  gemini:
+    tier1: "gemini-1.5-flash"
+    tier2: "gemini-1.5-pro"
+  deepseek:
+    tier1: "deepseek-chat"
+    tier2: "deepseek-chat"
+
+# Caching configurations
+caching:
+  enabled: true
+  database_path: "agent_router.db"
+  # Threshold for semantic cache match (0.0 to 1.0)
+  semantic_threshold: 0.88
+  # Provider and model to generate embeddings for semantic caching
+  embedding_provider: "openai" # openai, gemini, or none (falls back to exact cache only)
+  embedding_model: "text-embedding-3-small"
+
+# Routing rules
+routing:
+  default_tier: 1
+  # Max character length of prompt before bypassing complex checks and using Tier 1 for reads
+  max_read_context_threshold: 30000
+  # Keywords indicating a Tier 2 task
+  tier2_keywords:
+    - "fix"
+    - "debug"
+    - "refactor"
+    - "implement"
+    - "modify"
+    - "rewrite"
+    - "create"
+    - "write"
+    - "test"
+    - "fail"
+    - "error"
+    - "issue"
+    - "exception"
+    - "add support"
+    - "integrate"
+  # Keywords indicating a Tier 1 task (takes precedence over Tier 2 keywords if matched)
+  tier1_keywords:
+    - "explain"
+    - "what is"
+    - "how does"
+    - "summarize"
+    - "list"
+    - "read"
+    - "show"
+    - "find"
+    - "search"
+    - "where is"
+    - "get"
+    - "tell me about"

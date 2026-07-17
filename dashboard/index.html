@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Agent Router Dashboard</title>
+    <!-- Google Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- ChartJS for Metrics -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+    <div class="glow-bg"></div>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="main-header">
+            <div class="logo-area">
+                <div class="logo-icon">
+                    <i class="fa-solid fa-circle-nodes"></i>
+                </div>
+                <div class="logo-text">
+                    <h1>Agent<span>Router</span></h1>
+                    <span class="subtitle">AI Model Routing & Caching Proxy</span>
+                </div>
+            </div>
+            <div class="header-controls">
+                <div class="status-indicator">
+                    <span class="status-dot pulsing"></span>
+                    <span class="status-label">Proxy Active</span>
+                </div>
+                <button id="clearCacheBtn" class="btn btn-secondary">
+                    <i class="fa-solid fa-trash-can"></i> Clear Cache
+                </button>
+                <button id="refreshBtn" class="btn btn-primary">
+                    <i class="fa-solid fa-rotate"></i> Refresh
+                </button>
+            </div>
+        </header>
+
+        <!-- Stats Grid -->
+        <section class="stats-grid">
+            <!-- Card 1: Total Savings -->
+            <div class="stat-card savings-card">
+                <div class="stat-icon"><i class="fa-solid fa-hand-holding-dollar"></i></div>
+                <div class="stat-content">
+                    <span class="stat-label">Accumulated Savings</span>
+                    <span class="stat-value" id="costSavings">$0.00</span>
+                    <span class="stat-desc" id="actualCost">Total Cost: $0.00</span>
+                </div>
+                <div class="card-glow"></div>
+            </div>
+
+            <!-- Card 2: Cache Hit Rate -->
+            <div class="stat-card cache-card">
+                <div class="stat-icon"><i class="fa-solid fa-database"></i></div>
+                <div class="stat-content">
+                    <span class="stat-label">Cache Hit Rate</span>
+                    <span class="stat-value" id="cacheHitRate">0.0%</span>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="cacheProgressBar" style="width: 0%"></div>
+                    </div>
+                    <span class="stat-desc" id="cacheBreakdown">Exact: 0 | Semantic: 0</span>
+                </div>
+                <div class="card-glow"></div>
+            </div>
+
+            <!-- Card 3: Tokens & Requests -->
+            <div class="stat-card tokens-card">
+                <div class="stat-icon"><i class="fa-solid fa-microchip"></i></div>
+                <div class="stat-content">
+                    <span class="stat-label">Total Requests</span>
+                    <span class="stat-value" id="totalRequests">0</span>
+                    <span class="stat-desc" id="totalTokens">Tokens: 0</span>
+                </div>
+                <div class="card-glow"></div>
+            </div>
+
+            <!-- Card 4: Avg Latency -->
+            <div class="stat-card latency-card">
+                <div class="stat-icon"><i class="fa-solid fa-gauge-high"></i></div>
+                <div class="stat-content">
+                    <span class="stat-label">Avg Latency</span>
+                    <span class="stat-value" id="avgLatency">0ms</span>
+                    <span class="stat-desc">Time-to-complete metrics</span>
+                </div>
+                <div class="card-glow"></div>
+            </div>
+        </section>
+
+        <!-- Charts Section -->
+        <section class="charts-section">
+            <div class="chart-container">
+                <h3><i class="fa-solid fa-chart-pie"></i> Model Selection Share</h3>
+                <div class="chart-wrapper">
+                    <canvas id="modelShareChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h3><i class="fa-solid fa-chart-line"></i> Cache Hit vs Miss Distribution</h3>
+                <div class="chart-wrapper">
+                    <canvas id="cacheChart"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- History Table Section -->
+        <section class="history-section">
+            <div class="section-header">
+                <h2><i class="fa-solid fa-list-check"></i> Request Log History</h2>
+                <span class="badge" id="historyCount">Last 0 requests</span>
+            </div>
+            <div class="table-wrapper">
+                <table class="history-table">
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Original Model</th>
+                            <th>Routed Model</th>
+                            <th>Provider</th>
+                            <th>Cache Status</th>
+                            <th>Complexity</th>
+                            <th>Tokens</th>
+                            <th>Cost</th>
+                            <th>Latency</th>
+                            <th>Routing Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="historyTableBody">
+                        <tr>
+                            <td colspan="10" class="empty-state">No requests routed yet. Start querying the proxy at <code>http://localhost:8000/v1</code>.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <!-- Notification Toast -->
+    <div id="toast" class="toast hidden">
+        <i id="toastIcon" class="fa-solid fa-circle-info"></i>
+        <span id="toastMessage">Notification message</span>
+    </div>
+
+    <script src="/dashboard/app.js"></script>
+</body>
+</html>

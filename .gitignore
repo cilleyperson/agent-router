@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Databases
+agent_router.db
+test_agent_router.db
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+
+# Pytest / Coverage / Tool cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
