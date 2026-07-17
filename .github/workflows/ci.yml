@@ -1,0 +1,42 @@
+name: CI/CD Pipeline Checks
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  quality-and-security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-node-version: "ignore"
+          python-version: "3.11"
+
+      - name: Install Project Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff bandit pytest fastapi uvicorn httpx pyyaml pydantic numpy
+
+      - name: Run Code Linter Check (Ruff)
+        run: |
+          ruff check .
+
+      - name: Run Code Security Scan (Bandit)
+        run: |
+          bandit -r router/ -ll
+
+      - name: Run Pytest Unit Tests
+        run: |
+          python -m pytest tests/test_proxy.py

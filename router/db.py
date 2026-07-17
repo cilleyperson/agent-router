@@ -1,9 +1,7 @@
 import sqlite3
 import json
 import os
-import hashlib
-from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime
+from typing import Optional, Dict, Any, List
 
 class RouterDB:
     def __init__(self, db_path: str = "agent_router.db"):

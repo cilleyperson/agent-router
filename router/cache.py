@@ -6,7 +6,6 @@ import re
 import math
 from collections import Counter
 from typing import Optional, Dict, Any, List, Tuple
-import numpy as np
 
 from router.db import RouterDB
 

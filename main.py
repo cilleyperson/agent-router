@@ -1,5 +1,4 @@
 import os
-import sys
 import yaml
 import uvicorn
 import argparse
@@ -60,7 +59,7 @@ async def startup_event():
     os.makedirs("dashboard", exist_ok=True)
     
     print("--------------------------------------------------")
-    print(f"AI Agent Router Proxy successfully initialized.")
+    print("AI Agent Router Proxy successfully initialized.")
     print(f"Listening for OpenAI-compatible client requests on port {config.get('server', {}).get('port', 8000)}...")
     print(f"Metrics dashboard available at: http://localhost:{config.get('server', {}).get('port', 8000)}/dashboard")
     print("--------------------------------------------------")
@@ -206,7 +205,7 @@ def main():
         print(f"Total Model Cost:        ${metrics['total_cost']:.4f}")
         print(f"Accumulated Cost Saved:  ${metrics['cost_savings']:.4f}")
         print(f"Average Request Latency: {metrics['average_latency_ms']} ms")
-        print(f"Routed Model Shares:")
+        print("Routed Model Shares:")
         print(f"  Tier 1 (Low Cost):     {metrics['tier1_count']} requests")
         print(f"  Tier 2 (High Quality):  {metrics['tier2_count']} requests")
         print("===================================\n")

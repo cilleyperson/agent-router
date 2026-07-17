@@ -2,14 +2,14 @@ import os
 import sys
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import patch, MagicMock
 
 # Add main workspace to sys.path
 sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
-from main import app, load_config
+from main import app
 from router.classifier import ComplexityClassifier
-from router.cache import CacheEngine, LocalTFIDF
+from router.cache import LocalTFIDF
 from router.db import RouterDB
 
 TEST_DB_PATH = "test_agent_router.db"
@@ -88,7 +88,7 @@ def test_local_tfidf_vectorizer():
 
 @patch("httpx.AsyncClient.send")
 def test_cascade_routing_and_validation(mock_send):
-    db = RouterDB(TEST_DB_PATH)
+    RouterDB(TEST_DB_PATH)
     
     # Scenario: Tier 1 output has mismatched braces (fails validation) -> triggers escalation to Tier 2
     # Mock response 1: Tier 1 failure (unmatched curly braces)

@@ -76,7 +76,7 @@ class ProxyHandler:
         for block in blocks:
             # Check Python syntax errors
             if "IndentationError:" in block or "TabError:" in block or "SyntaxError:" in block:
-                return False, f"Contains code compilation error indicators"
+                return False, "Contains code compilation error indicators"
             
             # Check curly brackets match
             if block.count('{') != block.count('}'):
