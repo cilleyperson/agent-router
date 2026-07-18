@@ -150,3 +150,49 @@ curl -X POST http://localhost:8000/v1/feedback \
   -d "{\"prompt\": \"$(git log -1 --pretty=%B)\", \"success\": $([ $SUCCESS -eq 0 ] && echo "true" || echo "false")}"
 ```
 This loop ensures the router continuously refines its routing scoring mechanics!
+
+---
+
+## 🏠 Local Model Routing Setup (Optional)
+
+The router supports redirecting requests to locally hosted models (e.g. running on Ollama, LM Studio, or vLLM) to bypass external API costs and latencies for supported tasks.
+
+### 1. Recommended Local Models & Requirements
+
+Based on known code performance benchmarks, we suggest the following local models:
+
+*   **Tier 1 (Low Complexity)**:
+    *   **Model**: `qwen2.5-coder:7b` (Suggested) or `llama3:8b`
+    *   **Memory**: 8 GB RAM / VRAM minimum.
+    *   **Use Cases**: General chat, text explanations, code summaries, file structure reads.
+*   **Tier 2 (High Complexity)**:
+    *   **Model**: `qwen2.5-coder:32b` or `command-r`
+    *   **Memory**: 24 GB VRAM / 32 GB RAM minimum.
+    *   **Use Cases**: Advanced code refactoring, complex bug fixes, and logic validation.
+
+### 2. Start Your Local Model Server (Ollama Example)
+
+1.  Download and install Ollama from [ollama.com](https://ollama.com).
+2.  Start the Ollama daemon and pull the recommended Tier 1 model:
+    ```bash
+    ollama pull qwen2.5-coder:7b
+    ```
+3.  Ollama automatically exposes an OpenAI-compatible endpoint locally at `http://localhost:11434/v1`.
+
+### 3. Enable Local Routing in Config
+Open `config.yaml` and set `local_routing.enabled` to `true`:
+
+```yaml
+local_routing:
+  enabled: true                       # Enable local overrides
+  provider: "ollama"                  # "ollama" or "openai_compatible"
+  base_url: "http://localhost:11434"  # Default Ollama port
+  tier1:
+    model: "qwen2.5-coder:7b"         # Redirects all Tier 1 queries here
+  tier2:
+    enabled: false                    # Set true to also route Tier 2 locally
+    model: "qwen2.5-coder:32b"        # Requires high-end hardware/VRAM
+```
+
+When local routing is active, any local model run has a logged cost of **`$0.00`** in your metrics dashboard.
+

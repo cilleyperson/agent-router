@@ -84,3 +84,14 @@ routing:
     - "where is"
     - "get"
     - "tell me about"
+
+# Local model routing options (Optional overrides)
+local_routing:
+  enabled: false
+  provider: "ollama"                  # Can be "ollama" or "openai_compatible" (e.g., LM Studio, vLLM)
+  base_url: "http://localhost:11434"  # Default local endpoint
+  tier1:
+    model: "qwen2.5-coder:7b"         # Recommended local Tier 1 model
+  tier2:
+    enabled: false                    # Set true to route Tier 2 requests locally
+    model: "qwen2.5-coder:32b"        # Recommended local Tier 2 model (requires heavy VRAM)
