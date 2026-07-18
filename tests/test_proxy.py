@@ -255,3 +255,66 @@ def test_local_model_routing_redirection(mock_send):
             metrics = metrics_resp.json()
             assert metrics["total_cost"] == 0.0
 
+@patch("httpx.AsyncClient.send")
+def test_local_model_routing_complexity_bypass(mock_send):
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "id": "chatcmpl-remote456",
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "This is a high quality remote response."}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 8}
+    }
+    mock_send.return_value = mock_resp
+
+    with patch("main.load_config") as mock_load_config:
+        mock_load_config.return_value = {
+            "server": {"host": "127.0.0.1", "port": 8000},
+            "caching": {"enabled": True, "database_path": TEST_DB_PATH, "embedding_provider": "none"},
+            "tiers": {
+                "tier1": {"provider": "openai", "model": "gpt-4o-mini", "api_key_env": "TEST_KEY"},
+                "tier2": {"provider": "openai", "model": "gpt-4o", "api_key_env": "TEST_KEY"}
+            },
+            "routing": {
+                "default_tier": 1,
+                "cascade_enabled": False,
+                "compress_context": False,
+                "max_read_context_threshold": 30000,
+                "tier2_keywords": ["fix", "debug", "refactor"],
+                "tier1_keywords": ["explain"]
+            },
+            "local_routing": {
+                "enabled": True,
+                "provider": "ollama",
+                "base_url": "http://localhost:11434",
+                "max_complexity_threshold": 3.0,
+                "tier1": {"model": "qwen2.5-coder:7b"},
+                "tier2": {"enabled": False, "model": "qwen2.5-coder:32b"}
+            }
+        }
+        os.environ["TEST_KEY"] = "mock-key"
+        
+        with TestClient(app) as client:
+            # Query has keywords "fix", "debug", "refactor" (score 3 * 0.8 = 2.4)
+            # plus error trace keyword "exception" (+1.5) -> total score 3.9 (>= 3.0)
+            payload = {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "fix and debug and refactor compilation error exception trace"}]
+            }
+            
+            resp = client.post("/v1/chat/completions", json=payload)
+            assert resp.status_code == 200
+            assert resp.json()["choices"][0]["message"]["content"] == "This is a high quality remote response."
+            
+            # Verify request targeted remote OpenAI (not local Ollama)
+            assert mock_send.call_count == 1
+            args, _ = mock_send.call_args
+            request_obj = args[0]
+            assert "https://api.openai.com/v1/chat/completions" in str(request_obj.url)
+            
+            # Verify cost is NOT 0.0 (uses remote pricing)
+            metrics_resp = client.get("/api/metrics")
+            metrics = metrics_resp.json()
+            assert metrics["total_cost"] > 0.0
+
+
