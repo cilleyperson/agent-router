@@ -85,6 +85,10 @@ function updateStats(data) {
     document.getElementById("successRate").textContent = `${data.success_rate.toFixed(1)}%`;
     document.getElementById("feedbackCount").textContent = `Feedback: ${data.feedback_total} runs`;
 
+    // 6. Task Completion Cost Ratio
+    const ratio = data.task_completion_cost_ratio || 0;
+    document.getElementById("taskCostRatio").textContent = `$${ratio.toFixed(4)}`;
+
     // History count badge
     document.getElementById("historyCount").textContent = `Last ${data.history ? data.history.length : 0} requests`;
 }

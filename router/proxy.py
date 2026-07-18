@@ -98,7 +98,7 @@ class ProxyHandler:
         return True, "Validation passed"
 
     def openai_to_anthropic_req(self, openai_req: Dict[str, Any], target_model: str) -> Dict[str, Any]:
-        """Converts OpenAI request payload to Anthropic structure."""
+        """Converts OpenAI request payload to Anthropic structure, adding prompt caching control if enabled."""
         messages = openai_req.get("messages", [])
         system_parts = []
         filtered_messages = []
@@ -144,8 +144,19 @@ class ProxyHandler:
             "max_tokens": openai_req.get("max_tokens", 4096),
         }
         
+        prompt_caching_enabled = self.config.get("caching", {}).get("prompt_caching_enabled", True)
         if system_parts:
-            anthropic_req["system"] = "\n".join(system_parts)
+            system_text = "\n".join(system_parts)
+            if prompt_caching_enabled:
+                anthropic_req["system"] = [
+                    {
+                        "type": "text",
+                        "text": system_text,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+            else:
+                anthropic_req["system"] = system_text
             
         if "temperature" in openai_req:
             anthropic_req["temperature"] = openai_req["temperature"]
