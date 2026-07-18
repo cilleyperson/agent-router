@@ -1,5 +1,7 @@
 # 🤖 AI Agent Router Proxy
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 An efficient, cost-optimized API gateway and proxy designed for local AI agent CLIs and IDE extensions (e.g., Antigravity, Aider, Continue, Cursor, Roo Code). By intercepting outgoing model calls, the router optimizes token costs and latency while preserving execution quality.
 
 ---
@@ -201,4 +203,10 @@ Even when local routing is active, some requests require top-tier reasoning capa
 If a request's calculated complexity meets or exceeds the `max_complexity_threshold` (default `3.0`), the router **automatically bypasses local models** and sends the request to the configured remote Tier 2 model (like Claude Sonnet) to guarantee maximum accuracy.
 
 When local routing is active and utilized, the model run cost is logged as **`$0.00`** in your metrics dashboard.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](file:///c:/Users/jonat/dev-projects/agent-router/LICENSE) file for details.
 
