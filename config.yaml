@@ -90,6 +90,7 @@ local_routing:
   enabled: false
   provider: "ollama"                  # Can be "ollama" or "openai_compatible" (e.g., LM Studio, vLLM)
   base_url: "http://localhost:11434"  # Default local endpoint
+  max_complexity_threshold: 3.0       # Bypass local routing if complexity score is >= 3.0
   tier1:
     model: "qwen2.5-coder:7b"         # Recommended local Tier 1 model
   tier2:

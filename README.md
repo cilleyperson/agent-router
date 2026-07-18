@@ -187,12 +187,18 @@ local_routing:
   enabled: true                       # Enable local overrides
   provider: "ollama"                  # "ollama" or "openai_compatible"
   base_url: "http://localhost:11434"  # Default Ollama port
+  max_complexity_threshold: 3.0       # Bypass local routing if complexity score is >= 3.0
   tier1:
-    model: "qwen2.5-coder:7b"         # Redirects all Tier 1 queries here
+    model: "qwen2.5-coder:7b"         # Redirects Tier 1 queries here
   tier2:
     enabled: false                    # Set true to also route Tier 2 locally
     model: "qwen2.5-coder:32b"        # Requires high-end hardware/VRAM
 ```
 
-When local routing is active, any local model run has a logged cost of **`$0.00`** in your metrics dashboard.
+### 4. Dynamic Complexity Bypass
+Even when local routing is active, some requests require top-tier reasoning capabilities (e.g. debugging massive error logs, multi-file structural changes, diff integration). 
+
+If a request's calculated complexity meets or exceeds the `max_complexity_threshold` (default `3.0`), the router **automatically bypasses local models** and sends the request to the configured remote Tier 2 model (like Claude Sonnet) to guarantee maximum accuracy.
+
+When local routing is active and utilized, the model run cost is logged as **`$0.00`** in your metrics dashboard.
 

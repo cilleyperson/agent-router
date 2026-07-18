@@ -241,16 +241,20 @@ class ProxyHandler:
         local_base_url = ""
         
         if local_enabled:
-            if run_tier == 1:
-                is_local_routed = True
-                local_model = local_routing_config.get("tier1", {}).get("model", "qwen2.5-coder:7b")
-            elif run_tier == 2 and local_routing_config.get("tier2", {}).get("enabled", False):
-                is_local_routed = True
-                local_model = local_routing_config.get("tier2", {}).get("model", "qwen2.5-coder:32b")
-                
-            if is_local_routed:
-                local_provider = local_routing_config.get("provider", "ollama")
-                local_base_url = local_routing_config.get("base_url", "http://localhost:11434")
+            max_threshold = local_routing_config.get("max_complexity_threshold", 3.0)
+            if complexity_score >= max_threshold:
+                print(f"Bypassing local routing: complexity score ({complexity_score:.2f}) exceeds local threshold ({max_threshold:.2f}).")
+            else:
+                if run_tier == 1:
+                    is_local_routed = True
+                    local_model = local_routing_config.get("tier1", {}).get("model", "qwen2.5-coder:7b")
+                elif run_tier == 2 and local_routing_config.get("tier2", {}).get("enabled", False):
+                    is_local_routed = True
+                    local_model = local_routing_config.get("tier2", {}).get("model", "qwen2.5-coder:32b")
+                    
+                if is_local_routed:
+                    local_provider = local_routing_config.get("provider", "ollama")
+                    local_base_url = local_routing_config.get("base_url", "http://localhost:11434")
 
         if is_local_routed:
             provider = local_provider
@@ -589,7 +593,8 @@ class ProxyHandler:
         local_routing_config = self.config.get("local_routing", {})
         local_enabled = local_routing_config.get("enabled", False)
         
-        if local_enabled and local_routing_config.get("tier2", {}).get("enabled", False):
+        max_threshold = local_routing_config.get("max_complexity_threshold", 3.0)
+        if local_enabled and local_routing_config.get("tier2", {}).get("enabled", False) and complexity_score < max_threshold:
             provider2 = local_routing_config.get("provider", "ollama")
             routed_model2 = local_routing_config.get("tier2", {}).get("model", "qwen2.5-coder:32b")
             api_key2 = "local"
