@@ -51,6 +51,14 @@ class ProxyHandler:
 
     def calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> Tuple[float, float]:
         """Calculates input and output costs based on model pricing."""
+        local_routing_config = self.config.get("local_routing", {})
+        local_enabled = local_routing_config.get("enabled", False)
+        t1_local_model = local_routing_config.get("tier1", {}).get("model", "")
+        t2_local_model = local_routing_config.get("tier2", {}).get("model", "")
+
+        if local_enabled and (model == t1_local_model or model == t2_local_model or "ollama" in model.lower()):
+            return 0.0, 0.0
+
         match_model = "gpt-4o-mini"
         for key in PRICING:
             if key in model.lower():
@@ -223,32 +231,64 @@ class ProxyHandler:
             run_tier = tier
             routing_reason = reason
 
-        provider, routed_model, api_key_env = self.get_tier_settings(run_tier)
-        api_key = os.getenv(api_key_env)
+        # Check local model routing overrides
+        local_routing_config = self.config.get("local_routing", {})
+        local_enabled = local_routing_config.get("enabled", False)
+        
+        is_local_routed = False
+        local_provider = ""
+        local_model = ""
+        local_base_url = ""
+        
+        if local_enabled:
+            if run_tier == 1:
+                is_local_routed = True
+                local_model = local_routing_config.get("tier1", {}).get("model", "qwen2.5-coder:7b")
+            elif run_tier == 2 and local_routing_config.get("tier2", {}).get("enabled", False):
+                is_local_routed = True
+                local_model = local_routing_config.get("tier2", {}).get("model", "qwen2.5-coder:32b")
+                
+            if is_local_routed:
+                local_provider = local_routing_config.get("provider", "ollama")
+                local_base_url = local_routing_config.get("base_url", "http://localhost:11434")
 
-        if not api_key:
-            # Check backup env variables
-            for key_env in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"]:
-                fallback_key = os.getenv(key_env)
-                if fallback_key:
-                    api_key = fallback_key
-                    if "GEMINI" in key_env:
-                        provider, routed_model = "gemini", "gemini-1.5-flash"
-                    elif "ANTHROPIC" in key_env:
-                        provider, routed_model = "anthropic", "claude-3-5-haiku-20241022"
-                    else:
-                        provider, routed_model = "openai", "gpt-4o-mini"
-                    break
-            
+        if is_local_routed:
+            provider = local_provider
+            routed_model = local_model
+            api_key = "local"
+            routing_reason = f"Local Routing Override; {routing_reason}"
+        else:
+            provider, routed_model, api_key_env = self.get_tier_settings(run_tier)
+            api_key = os.getenv(api_key_env)
+
             if not api_key:
-                raise HTTPException(
-                    status_code=500, 
-                    detail="No API Keys found. Please set OPENAI_API_KEY, GEMINI_API_KEY, or ANTHROPIC_API_KEY."
-                )
+                # Check backup env variables
+                for key_env in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"]:
+                    fallback_key = os.getenv(key_env)
+                    if fallback_key:
+                        api_key = fallback_key
+                        if "GEMINI" in key_env:
+                            provider, routed_model = "gemini", "gemini-1.5-flash"
+                        elif "ANTHROPIC" in key_env:
+                            provider, routed_model = "anthropic", "claude-3-5-haiku-20241022"
+                        else:
+                            provider, routed_model = "openai", "gpt-4o-mini"
+                        break
+                
+                if not api_key:
+                    raise HTTPException(
+                        status_code=500, 
+                        detail="No API Keys found. Please set OPENAI_API_KEY, GEMINI_API_KEY, or ANTHROPIC_API_KEY."
+                    )
 
         body["model"] = routed_model
 
-        if provider == "openai":
+        if provider in ["ollama", "openai_compatible", "local"]:
+            url = f"{local_base_url}/v1/chat/completions"
+            headers = {"Authorization": "Bearer local", "Content-Type": "application/json"}
+            return await self._dispatch_request(provider, url, headers, body, canonical_messages, complexity_score, routed_model, requested_model, run_tier, routing_reason, start_time, is_cascade)
+
+        elif provider == "openai":
             url = "https://api.openai.com/v1/chat/completions"
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
             return await self._dispatch_request("openai", url, headers, body, canonical_messages, complexity_score, routed_model, requested_model, run_tier, routing_reason, start_time, is_cascade)
@@ -291,7 +331,7 @@ class ProxyHandler:
 
             # Parse content text
             content_text = ""
-            if provider in ["openai", "gemini"]:
+            if provider in ["openai", "gemini", "ollama", "openai_compatible", "local"]:
                 content_text = res_data.get("choices", [{}])[0].get("message", {}).get("content", "")
             elif provider == "anthropic":
                 content_text = ""
@@ -526,7 +566,7 @@ class ProxyHandler:
 
             # Normal streaming routing
             else:
-                if provider in ["openai", "gemini"]:
+                if provider in ["openai", "gemini", "ollama", "openai_compatible", "local"]:
                     return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
                 else:
                     return await self._proxy_anthropic(url, headers, body, messages, complexity_score, routed_model, requested_model, provider, tier, reason, start_time)
@@ -546,34 +586,48 @@ class ProxyHandler:
                                   complexity_score: float, requested_model: str, 
                                   reason: str, start_time: float) -> Any:
         """Escalates request execution to Tier 2 model."""
-        provider2, routed_model2, api_key_env2 = self.get_tier_settings(2)
-        api_key2 = os.getenv(api_key_env2)
+        local_routing_config = self.config.get("local_routing", {})
+        local_enabled = local_routing_config.get("enabled", False)
         
-        if not api_key2:
-            raise HTTPException(status_code=500, detail=f"No API Key found for Tier 2: {api_key_env2}")
-
-        body["model"] = routed_model2
-        print(f"Escalation executing Tier 2 model: {provider2}/{routed_model2}")
-
-        if provider2 == "openai":
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {api_key2}", "Content-Type": "application/json"}
+        if local_enabled and local_routing_config.get("tier2", {}).get("enabled", False):
+            provider2 = local_routing_config.get("provider", "ollama")
+            routed_model2 = local_routing_config.get("tier2", {}).get("model", "qwen2.5-coder:32b")
+            api_key2 = "local"
+            local_base_url = local_routing_config.get("base_url", "http://localhost:11434")
+            
+            body["model"] = routed_model2
+            url = f"{local_base_url}/v1/chat/completions"
+            headers = {"Authorization": "Bearer local", "Content-Type": "application/json"}
             return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+        else:
+            provider2, routed_model2, api_key_env2 = self.get_tier_settings(2)
+            api_key2 = os.getenv(api_key_env2)
+            
+            if not api_key2:
+                raise HTTPException(status_code=500, detail=f"No API Key found for Tier 2: {api_key_env2}")
 
-        elif provider2 == "gemini":
-            url = "https://generativelanguage.googleapis.com/v1beta/openai/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {api_key2}", "Content-Type": "application/json"}
-            return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+            body["model"] = routed_model2
+            print(f"Escalation executing Tier 2 model: {provider2}/{routed_model2}")
 
-        elif provider2 == "anthropic":
-            url = "https://api.anthropic.com/v1/messages"
-            headers = {
-                "x-api-key": api_key2,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            }
-            anthropic_body = self.openai_to_anthropic_req(body, routed_model2)
-            return await self._proxy_anthropic(url, headers, anthropic_body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+            if provider2 == "openai":
+                url = "https://api.openai.com/v1/chat/completions"
+                headers = {"Authorization": f"Bearer {api_key2}", "Content-Type": "application/json"}
+                return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+
+            elif provider2 == "gemini":
+                url = "https://generativelanguage.googleapis.com/v1beta/openai/v1/chat/completions"
+                headers = {"Authorization": f"Bearer {api_key2}", "Content-Type": "application/json"}
+                return await self._proxy_openai(url, headers, body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
+
+            elif provider2 == "anthropic":
+                url = "https://api.anthropic.com/v1/messages"
+                headers = {
+                    "x-api-key": api_key2,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                }
+                anthropic_body = self.openai_to_anthropic_req(body, routed_model2)
+                return await self._proxy_anthropic(url, headers, anthropic_body, messages, complexity_score, routed_model2, requested_model, provider2, 2, reason, start_time)
 
     def _translate_anthropic_to_openai_res(self, res_data: Dict[str, Any], model: str) -> Dict[str, Any]:
         """Translates Anthropic JSON response to OpenAI JSON format."""
