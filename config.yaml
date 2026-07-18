@@ -43,6 +43,8 @@ caching:
   # Set to "local" to use the fast, offline TF-IDF semantic router
   embedding_provider: "local" 
   embedding_model: "none"
+  # Enable downstream provider prompt caching annotations (e.g. Anthropic)
+  prompt_caching_enabled: true
 
 # Routing rules
 routing:
@@ -53,6 +55,8 @@ routing:
   compress_context: true
   # Max character length of prompt before bypassing complex checks and using Tier 1 for reads
   max_read_context_threshold: 30000
+  # Strict token budget limit for context window (prunes oldest chat items if exceeded)
+  context_token_budget: 8192
   # Keywords indicating a Tier 2 task
   tier2_keywords:
     - "fix"

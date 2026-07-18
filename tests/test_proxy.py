@@ -11,6 +11,7 @@ from main import app
 from router.classifier import ComplexityClassifier
 from router.cache import LocalTFIDF
 from router.db import RouterDB
+from router.proxy import ProxyHandler
 
 TEST_DB_PATH = "test_agent_router.db"
 
@@ -316,5 +317,100 @@ def test_local_model_routing_complexity_bypass(mock_send):
             metrics_resp = client.get("/api/metrics")
             metrics = metrics_resp.json()
             assert metrics["total_cost"] > 0.0
+
+def test_context_budgeting_pruning():
+    # Setup classifier with a small token budget (e.g. 50 tokens)
+    # 50 tokens ~ 200 characters
+    classifier = ComplexityClassifier({
+        "routing": {
+            "compress_context": False,
+            "context_token_budget": 50
+        }
+    })
+    
+    messages = [
+        {"role": "system", "content": "You are a coding assistant."}, # ~30 chars / 7 tokens
+        {"role": "user", "content": "Hello. I need help with sorting algorithms. They are useful for sorting lists. Let us write bubble sort and merge sort."}, # ~135 chars / 33 tokens
+        {"role": "assistant", "content": "Sure, bubble sort is simple but slow. Merge sort is faster. Let us start."}, # ~73 chars / 18 tokens
+        {"role": "user", "content": "Can you explain quicksort?"} # ~26 chars / 6 tokens
+    ]
+    # Total tokens is about 7 + 33 + 18 + 6 = 64 tokens, which exceeds 50.
+    
+    canonical = classifier.canonicalize_messages(messages)
+    
+    # System message should be preserved
+    assert canonical[0]["role"] == "system"
+    assert "coding assistant" in canonical[0]["content"]
+    
+    # Pruned content warning should be inserted
+    assert canonical[1]["role"] == "system"
+    assert "[Context pruned to fit token budget]" in canonical[1]["content"]
+    
+    # Most recent user message should be preserved
+    assert canonical[-1]["role"] == "user"
+    assert "quicksort" in canonical[-1]["content"]
+
+def test_anthropic_prompt_caching_serialization():
+    # Setup ProxyHandler with prompt caching enabled
+    config_enabled = {
+        "caching": {"prompt_caching_enabled": True},
+        "routing": {"cascade_enabled": False}
+    }
+    proxy_enabled = ProxyHandler(None, None, None, config_enabled)
+    
+    openai_req = {
+        "messages": [
+            {"role": "system", "content": "System prompt instructions"},
+            {"role": "user", "content": "hello"}
+        ]
+    }
+    
+    req_enabled = proxy_enabled.openai_to_anthropic_req(openai_req, "claude-3-5-sonnet")
+    # System should be block array with cache_control
+    assert isinstance(req_enabled["system"], list)
+    assert req_enabled["system"][0]["text"] == "System prompt instructions"
+    assert req_enabled["system"][0]["cache_control"] == {"type": "ephemeral"}
+    
+    # Setup ProxyHandler with prompt caching disabled
+    config_disabled = {
+        "caching": {"prompt_caching_enabled": False},
+        "routing": {"cascade_enabled": False}
+    }
+    proxy_disabled = ProxyHandler(None, None, None, config_disabled)
+    req_disabled = proxy_disabled.openai_to_anthropic_req(openai_req, "claude-3-5-sonnet")
+    # System should be a plain string
+    assert isinstance(req_disabled["system"], str)
+    assert req_disabled["system"] == "System prompt instructions"
+
+def test_db_task_completion_cost_ratio():
+    db = RouterDB(TEST_DB_PATH)
+    
+    # Log 3 requests
+    # Request 1: success = 1, cost = $0.05
+    db.log_request(
+        prompt="prompt 1", complexity_score=1.0, routed_model="gpt-4o", requested_model="gpt-4o",
+        provider="openai", input_tokens=1000, output_tokens=2000, input_cost=0.01, output_cost=0.04,
+        tier_selected=2, routing_reason="test", duration_ms=500, cache_hit="none", success=1
+    )
+    # Request 2: success = 0 (failed), cost = $0.01
+    db.log_request(
+        prompt="prompt 2", complexity_score=1.0, routed_model="gpt-4o-mini", requested_model="gpt-4o",
+        provider="openai", input_tokens=500, output_tokens=500, input_cost=0.005, output_cost=0.005,
+        tier_selected=1, routing_reason="test", duration_ms=200, cache_hit="none", success=0
+    )
+    # Request 3: success = 1, cost = $0.02
+    db.log_request(
+        prompt="prompt 3", complexity_score=1.0, routed_model="gpt-4o", requested_model="gpt-4o",
+        provider="openai", input_tokens=500, output_tokens=1000, input_cost=0.005, output_cost=0.015,
+        tier_selected=2, routing_reason="test", duration_ms=400, cache_hit="none", success=1
+    )
+    
+    metrics = db.get_metrics()
+    
+    # Total actual cost: 0.05 + 0.01 + 0.02 = 0.08
+    # Success count: 2 (prompt 1 and prompt 3)
+    # task_completion_cost_ratio = 0.08 / 2 = 0.04
+    assert metrics["task_completion_cost_ratio"] == 0.04
+
 
 

@@ -10,6 +10,7 @@ class ComplexityClassifier:
         self.tier2_keywords = self.routing_config.get("tier2_keywords", [])
         self.tier1_keywords = self.routing_config.get("tier1_keywords", [])
         self.compress_context_enabled = self.routing_config.get("compress_context", True)
+        self.context_token_budget = self.routing_config.get("context_token_budget", None)
 
     def estimate_tokens(self, text: str) -> int:
         """Estimates token count based on character length (approx 4 chars per token)."""
@@ -64,6 +65,67 @@ class ComplexityClassifier:
         except Exception:
             return text
 
+    def enforce_context_budget(self, messages: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
+        """
+        Enforces a strict token budget on messages.
+        Preserves all system messages and prunes older user/assistant messages in the middle,
+        leaving the latest user/assistant messages, and inserting a placeholder.
+        """
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        other_msgs = [m for m in messages if m.get("role") != "system"]
+        
+        # Calculate tokens for system messages
+        system_text = ""
+        for m in system_msgs:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                system_text += content
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        system_text += part.get("text", "")
+        system_tokens = self.estimate_tokens(system_text)
+        
+        # If system messages themselves exceed budget, keep only the system messages and the last user message
+        if system_tokens >= max_tokens:
+            if other_msgs:
+                return system_msgs + [other_msgs[-1]]
+            return system_msgs
+            
+        remaining_budget = max_tokens - system_tokens
+        
+        # Add other_msgs starting from the end until budget is reached
+        pruned_others = []
+        current_tokens = 0
+        pruned_any = False
+        
+        for msg in reversed(other_msgs):
+            content = msg.get("content", "")
+            msg_text = ""
+            if isinstance(content, str):
+                msg_text = content
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        msg_text += part.get("text", "")
+            
+            msg_tokens = self.estimate_tokens(msg_text)
+            if current_tokens + msg_tokens <= remaining_budget:
+                pruned_others.insert(0, msg)
+                current_tokens += msg_tokens
+            else:
+                pruned_any = True
+                break
+                
+        if pruned_any:
+            placeholder = {
+                "role": "system",
+                "content": "... [Context pruned to fit token budget] ..."
+            }
+            pruned_others.insert(0, placeholder)
+            
+        return system_msgs + pruned_others
+
     def canonicalize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Groups system messages first and normalizes dynamic dates/times to stabilize prefix caching."""
         system_msgs = []
@@ -100,7 +162,10 @@ class ComplexityClassifier:
                                 
                 other_msgs.append(msg)
                 
-        return system_msgs + other_msgs
+        canonical = system_msgs + other_msgs
+        if self.context_token_budget:
+            canonical = self.enforce_context_budget(canonical, self.context_token_budget)
+        return canonical
 
     def analyze_request(self, messages: List[Dict[str, Any]]) -> Tuple[int, float, str]:
         """

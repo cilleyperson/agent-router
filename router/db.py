@@ -274,6 +274,7 @@ class RouterDB:
 
         cache_hit_rate = ((exact_hits + semantic_hits) / total_reqs * 100) if total_reqs > 0 else 0.0
         success_rate = (success_count / feedback_total * 100) if feedback_total > 0 else 100.0
+        task_completion_cost_ratio = (total_actual_cost / success_count) if success_count > 0 else 0.0
 
         return {
             "total_requests": total_reqs,
@@ -288,5 +289,6 @@ class RouterDB:
             "tier2_count": t2_count,
             "success_rate": round(success_rate, 1),
             "feedback_total": feedback_total,
+            "task_completion_cost_ratio": round(task_completion_cost_ratio, 6),
             "history": history
         }

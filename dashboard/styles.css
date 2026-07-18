@@ -275,6 +275,16 @@ body {
     border-color: rgba(56, 189, 248, 0.15);
 }
 
+.ratio-card .stat-icon {
+    color: #fb923c;
+    background: rgba(251, 146, 60, 0.08);
+    border-color: rgba(251, 146, 60, 0.15);
+}
+
+.ratio-card .stat-value {
+    color: #fb923c;
+}
+
 .stat-content {
     display: flex;
     flex-direction: column;
